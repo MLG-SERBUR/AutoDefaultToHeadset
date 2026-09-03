@@ -123,8 +123,12 @@ internal static class Program
                 WriteInfo("PID: " + Environment.ProcessId.ToString(CultureInfo.InvariantCulture) + ". Logging: console only");
                 WriteInfo("Render match: " + options.RenderDescription);
                 WriteInfo("Capture match: " + options.CaptureDescription);
-
+                WriteInfo("Args: " + string.Join(" ", args.Select(a => a.Contains(' ') ? "\"" + a + "\"" : a)));
+                DumpSystemInfo();
+                controller.DumpDiagnostics("startup");
                 controller.ApplyDefaults("startup");
+                controller.DumpDiagnostics("after startup apply");
+                WriteInfo("Tip: This console is intentionally visible in --background so you can copy diagnostics. To hide, close this window and rely on Startup shortcut.");
                 return RunEventLoop(controller);
             }
             finally
@@ -299,7 +303,9 @@ internal static class Program
     {
         private readonly Options _options;
         private readonly IMMDeviceEnumerator _enumerator;
-        private readonly IPolicyConfig _policyConfig;
+        private readonly IPolicyConfig? _policyConfig;
+        private readonly IPolicyConfigVista? _policyConfigVista;
+        private readonly string _policySource;
         private readonly NotificationClient _notificationClient;
         private uint _eventThreadId;
         private bool _registered;
@@ -308,8 +314,42 @@ internal static class Program
         {
             _options = options;
             _enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.MMDeviceEnumerator, throwOnError: true)!)!;
-            _policyConfig = (IPolicyConfig)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.PolicyConfigClient, throwOnError: true)!)!;
+            (_policyConfig, _policyConfigVista, _policySource) = CreatePolicyConfig();
+            if (_policyConfig == null && _policyConfigVista == null)
+            {
+                WriteError("Failed to create PolicyConfig client. SetDefaultEndpoint will fail. HR lookup: try running as admin.");
+            }
+            else
+            {
+                WriteInfo("PolicyConfig client: " + _policySource);
+            }
             _notificationClient = new NotificationClient(RequestEndpointApply);
+        }
+
+        private static (IPolicyConfig? primary, IPolicyConfigVista? vista, string source) CreatePolicyConfig()
+        {
+            // Try primary client (Win7-11) first, then Vista client as fallback.
+            try
+            {
+                var pc = (IPolicyConfig)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.PolicyConfigClient, throwOnError: true)!)!;
+                return (pc, null, "CPolicyConfigClient(870AF99C)+IPolicyConfig(F8679F50)");
+            }
+            catch (Exception ex)
+            {
+                WriteError("CPolicyConfigClient create failed: " + ex.Message);
+            }
+
+            try
+            {
+                var vista = (IPolicyConfigVista)Activator.CreateInstance(Type.GetTypeFromCLSID(ComIds.PolicyConfigVistaClient, throwOnError: true)!)!;
+                return (null, vista, "CPolicyConfigVistaClient(294935CE)+IPolicyConfigVista(568B9108)");
+            }
+            catch (Exception ex)
+            {
+                WriteError("CPolicyConfigVistaClient create failed: " + ex.Message);
+            }
+
+            return (null, null, "none");
         }
 
         public void RegisterNotifications()
@@ -355,31 +395,163 @@ internal static class Program
         {
             try
             {
-                var render = FindBestDevice(EDataFlow.eRender, _options.RenderId, _options.RenderMatches);
-                var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureId, _options.CaptureMatches);
+                // Log current defaults before attempt (helps diagnose comm vs default)
+                LogCurrentDefaults("before " + source);
 
-                if (render != null)
+                // Retry loop: device may not be ready immediately after plug
+                for (var attempt = 0; attempt < 3; attempt++)
                 {
-                    SetDefaultForAllRoles(render, source);
-                }
-                else
-                {
-                    WriteInfo("No active render device matched " + _options.RenderDescription + ".");
-                }
+                    var render = FindBestDevice(EDataFlow.eRender, _options.RenderId, _options.RenderMatches);
+                    var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureId, _options.CaptureMatches);
 
-                if (capture != null)
-                {
-                    SetDefaultForAllRoles(capture, source);
-                }
-                else
-                {
-                    WriteInfo("No active capture device matched " + _options.CaptureDescription + ".");
+                    var didWork = false;
+
+                    if (render != null)
+                    {
+                        WriteInfo("Matched render for " + source + " (attempt " + (attempt + 1) + "): " + render.Name + " [" + render.State + "] " + render.Id);
+                        didWork |= SetDefaultForAllRoles(render, source);
+                    }
+                    else
+                    {
+                        WriteInfo("No active render device matched " + _options.RenderDescription + ". (attempt " + (attempt + 1) + ")");
+                    }
+
+                    if (capture != null)
+                    {
+                        WriteInfo("Matched capture for " + source + " (attempt " + (attempt + 1) + "): " + capture.Name + " [" + capture.State + "] " + capture.Id);
+                        didWork |= SetDefaultForAllRoles(capture, source);
+                    }
+                    else
+                    {
+                        WriteInfo("No active capture device matched " + _options.CaptureDescription + ". (attempt " + (attempt + 1) + ")");
+                    }
+
+                    // verify after set
+                    Thread.Sleep(250);
+                    LogCurrentDefaults("after " + source + " attempt " + (attempt + 1));
+
+                    // check if verification shows our device is now default
+                    var renderOk = render == null || IsDefault(render.Id, EDataFlow.eRender, ERole.eConsole) || IsDefault(render.Id, EDataFlow.eRender, ERole.eMultimedia) || IsDefault(render.Id, EDataFlow.eRender, ERole.eCommunications);
+                    var captureOk = capture == null || IsDefault(capture.Id, EDataFlow.eCapture, ERole.eConsole) || IsDefault(capture.Id, EDataFlow.eCapture, ERole.eCommunications);
+
+                    if (didWork && renderOk && captureOk)
+                    {
+                        break;
+                    }
+
+                    if (attempt < 2)
+                    {
+                        WriteInfo("Retrying apply " + source + " in 800ms (renderOk=" + renderOk + " captureOk=" + captureOk + ")");
+                        Thread.Sleep(800);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 WriteError("Failed to apply defaults from " + source + ".", ex);
             }
+        }
+
+        private void LogCurrentDefaults(string context)
+        {
+            foreach (var flow in new[] { EDataFlow.eRender, EDataFlow.eCapture })
+            {
+                foreach (var role in new[] { ERole.eConsole, ERole.eMultimedia, ERole.eCommunications })
+                {
+                    var id = GetDefaultDeviceId(flow, role);
+                    var name = id != null ? TryGetFriendlyNameById(id) : "(none)";
+                    WriteInfo("Default " + context + ": " + flow + " " + role + " = " + (name ?? id ?? "(null)") + " [" + (id ?? "null") + "]");
+                }
+            }
+        }
+
+        private string? GetDefaultDeviceId(EDataFlow flow, ERole role)
+        {
+            try
+            {
+                var hr = _enumerator.GetDefaultAudioEndpoint(flow, role, out var device);
+                if (hr != 0 || device == null)
+                {
+                    return null;
+                }
+                device.GetId(out var id);
+                return id;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private bool IsDefault(string id, EDataFlow flow, ERole role)
+        {
+            var def = GetDefaultDeviceId(flow, role);
+            return def != null && string.Equals(def, id, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private string? TryGetFriendlyNameById(string id)
+        {
+            try
+            {
+                if (_enumerator.GetDevice(id, out var dev) != 0) return null;
+                return GetFriendlyName(dev);
+            }
+            catch { return null; }
+        }
+
+        public void DumpDiagnostics(string context)
+        {
+            try
+            {
+                WriteInfo("=== Audio Diagnostics: " + context + " ===");
+                foreach (var flow in new[] { EDataFlow.eRender, EDataFlow.eCapture })
+                {
+                    var label = flow == EDataFlow.eRender ? "Output" : "Input";
+                    WriteInfo("-- " + label + " (" + flow + ") all states --");
+                    var all = EnumerateDevices(flow, DeviceState.All);
+                    if (all.Count == 0) WriteInfo("  (no devices)");
+                    foreach (var d in all.OrderBy(x => x.State).ThenBy(x => x.Name))
+                    {
+                        var defaults = "";
+                        foreach (var role in new[] { ERole.eConsole, ERole.eMultimedia, ERole.eCommunications })
+                        {
+                            if (IsDefault(d.Id, flow, role)) defaults += " [DEFAULT " + role + "]";
+                        }
+                        if (defaults.Length == 0 && d.State != DeviceState.Active) defaults = "";
+                        WriteInfo("  [" + d.State + "]" + defaults + " " + d.Name);
+                        WriteInfo("       Id: " + d.Id);
+                    }
+                    // defaults per role summary
+                    foreach (var role in new[] { ERole.eConsole, ERole.eMultimedia, ERole.eCommunications })
+                    {
+                        var defId = GetDefaultDeviceId(flow, role);
+                        var defName = defId != null ? TryGetFriendlyNameById(defId) ?? "(unnamed)" : "(none)";
+                        WriteInfo("  Default " + flow + " " + role + ": " + defName + " [" + (defId ?? "null") + "]");
+                    }
+                }
+                // show what would match
+                var render = FindBestDevice(EDataFlow.eRender, _options.RenderId, _options.RenderMatches);
+                var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureId, _options.CaptureMatches);
+                WriteInfo("Match render: " + (render != null ? render.Name + " [" + render.State + "] " + render.Id : "NONE for " + _options.RenderDescription));
+                WriteInfo("Match capture: " + (capture != null ? capture.Name + " [" + capture.State + "] " + capture.Id : "NONE for " + _options.CaptureDescription));
+                // explicit check for exact IDs if supplied
+                if (!string.IsNullOrWhiteSpace(_options.RenderId))
+                {
+                    var devId = _options.RenderId;
+                    var exists = EnumerateDevices(EDataFlow.eRender, DeviceState.All).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
+                    var active = EnumerateDevices(EDataFlow.eRender, DeviceState.Active).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
+                    WriteInfo("RenderId " + devId + " exists(all)=" + exists + " active=" + active);
+                }
+                if (!string.IsNullOrWhiteSpace(_options.CaptureId))
+                {
+                    var devId = _options.CaptureId;
+                    var exists = EnumerateDevices(EDataFlow.eCapture, DeviceState.All).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
+                    var active = EnumerateDevices(EDataFlow.eCapture, DeviceState.Active).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
+                    WriteInfo("CaptureId " + devId + " exists(all)=" + exists + " active=" + active);
+                }
+                WriteInfo("=== End Audio Diagnostics ===");
+            }
+            catch (Exception ex) { WriteError("DumpDiagnostics failed", ex); }
         }
 
         public void PrintDevices()
@@ -516,11 +688,28 @@ internal static class Program
             var devices = EnumerateDevices(flow, DeviceState.All);
             foreach (var device in devices)
             {
-                Console.WriteLine("  State: " + device.State);
+                var marker = "";
+                foreach (var role in new[] { ERole.eConsole, ERole.eMultimedia, ERole.eCommunications })
+                {
+                    if (IsDefault(device.Id, flow, role))
+                    {
+                        marker += " [DEFAULT:" + role + "]";
+                    }
+                }
+                Console.WriteLine("  State: " + device.State + marker);
                 Console.WriteLine("  Name:  " + device.Name);
                 Console.WriteLine("  Id:    " + device.Id);
                 Console.WriteLine();
             }
+
+            // also dump current defaults per role
+            Console.WriteLine("Current defaults (" + label + "):");
+            foreach (var role in new[] { ERole.eConsole, ERole.eMultimedia, ERole.eCommunications })
+            {
+                var defId = GetDefaultDeviceId(flow, role);
+                Console.WriteLine("  " + role + ": " + (defId ?? "(none)") + " -> " + (defId != null ? TryGetFriendlyNameById(defId) : ""));
+            }
+            Console.WriteLine();
         }
 
         private AudioDevice? FindBestDevice(EDataFlow flow, string? exactId, IReadOnlyList<string> matches)
@@ -601,23 +790,79 @@ internal static class Program
             }
         }
 
-        private void SetDefaultForAllRoles(AudioDevice device, string source)
+        private bool SetDefaultForAllRoles(AudioDevice device, string source)
         {
-            SetDefault(device, ERole.eConsole, source);
-            SetDefault(device, ERole.eMultimedia, source);
-            SetDefault(device, ERole.eCommunications, source);
+            var okConsole = SetDefault(device, ERole.eConsole, source);
+            var okMultimedia = SetDefault(device, ERole.eMultimedia, source);
+            var okComm = SetDefault(device, ERole.eCommunications, source);
+            return okConsole || okMultimedia || okComm;
         }
 
-        private void SetDefault(AudioDevice device, ERole role, string source)
+        private bool SetDefault(AudioDevice device, ERole role, string source)
         {
-            var hr = _policyConfig.SetDefaultEndpoint(device.Id, role);
-            if (hr == 0)
+            int hr;
+            string which;
+            if (_policyConfig != null)
             {
-                WriteInfo("Set " + device.Flow + " " + role + " from " + source + ": " + device.Name);
-                return;
+                hr = _policyConfig.SetDefaultEndpoint(device.Id, role);
+                which = "IPolicyConfig";
+            }
+            else if (_policyConfigVista != null)
+            {
+                hr = _policyConfigVista.SetDefaultEndpoint(device.Id, role);
+                which = "IPolicyConfigVista";
+            }
+            else
+            {
+                WriteError("No PolicyConfig available to set " + device.Flow + " " + role + ". Device: " + device.Name);
+                return false;
             }
 
-            WriteError("Failed to set " + device.Flow + " " + role + ". HRESULT: 0x" + hr.ToString("X8", CultureInfo.InvariantCulture) + ". Device: " + device.Name);
+            // Fallback: if primary failed, try the other client once
+            if (hr != 0 && _policyConfig != null && _policyConfigVista != null)
+            {
+                // already tried primary; try vista as second attempt (should not happen since we only have one)
+            }
+            else if (hr != 0 && _policyConfig == null && _policyConfigVista != null)
+            {
+                // no fallback needed
+            }
+
+            if (hr == 0)
+            {
+                // verify
+                Thread.Sleep(80);
+                var isDef = IsDefault(device.Id, device.Flow, role);
+                WriteInfo("Set " + device.Flow + " " + role + " from " + source + " via " + which + ": " + device.Name + " HR=0x00000000 verify=" + (isDef ? "OK" : "MISMATCH"));
+                if (!isDef)
+                {
+                    var cur = GetDefaultDeviceId(device.Flow, role);
+                    WriteError("Verify failed after SetDefaultEndpoint " + role + ". Expected " + device.Id + " got " + (cur ?? "null") + ". Try running as admin. HR=0x" + hr.ToString("X8", CultureInfo.InvariantCulture));
+                }
+                return isDef;
+            }
+
+            var msg = GetHrMessage(hr);
+            WriteError("Failed to set " + device.Flow + " " + role + " via " + which + ". HRESULT: 0x" + hr.ToString("X8", CultureInfo.InvariantCulture) + " (" + msg + "). Device: " + device.Name + " Id: " + device.Id);
+            if ((uint)hr == 0x80070005)
+            {
+                WriteError("Access denied (0x80070005) - try Run as Administrator or Task Scheduler with /RL HIGHEST.");
+            }
+            if ((uint)hr == 0x80070490) // ERROR_NOT_FOUND
+            {
+                WriteError("Device not found - device may not be ready yet or Id changed.");
+            }
+            return false;
+        }
+
+        private static string GetHrMessage(int hr)
+        {
+            try
+            {
+                var ex = Marshal.GetExceptionForHR(hr);
+                return ex?.Message ?? "unknown";
+            }
+            catch { return "unknown"; }
         }
 
         public void Dispose()
@@ -631,6 +876,11 @@ internal static class Program
         private readonly Action _onChanged;
         private readonly object _gate = new();
         private DateTimeOffset _lastRun = DateTimeOffset.MinValue;
+        private CancellationTokenSource? _pendingCts;
+        // Coalesce burst events (headset often fires render + capture within ~300ms)
+        // Leading edge fires immediately, trailing edge fires 700ms after last burst event
+        private static readonly TimeSpan CoalesceWindow = TimeSpan.FromMilliseconds(700);
+        private static readonly TimeSpan MinInterval = TimeSpan.FromMilliseconds(250);
 
         public NotificationClient(Action onChanged)
         {
@@ -639,61 +889,93 @@ internal static class Program
 
         public int OnDeviceStateChanged([MarshalAs(UnmanagedType.LPWStr)] string deviceId, DeviceState newState)
         {
+            WriteInfo("Notify OnDeviceStateChanged: " + newState + " id=" + deviceId);
             if (newState == DeviceState.Active)
             {
                 RunDebounced();
             }
-
             return 0;
         }
 
         public int OnDeviceAdded([MarshalAs(UnmanagedType.LPWStr)] string deviceId)
         {
+            WriteInfo("Notify OnDeviceAdded: id=" + deviceId);
             RunDebounced();
             return 0;
         }
 
         public int OnDeviceRemoved([MarshalAs(UnmanagedType.LPWStr)] string deviceId)
         {
+            WriteInfo("Notify OnDeviceRemoved: id=" + deviceId);
             return 0;
         }
 
         public int OnDefaultDeviceChanged(EDataFlow flow, ERole role, [MarshalAs(UnmanagedType.LPWStr)] string? defaultDeviceId)
         {
+            // ignore - avoids feedback loop when we just set default
             return 0;
         }
 
         public int OnPropertyValueChanged([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ref PropertyKey key)
         {
+            WriteInfo("Notify OnPropertyValueChanged: id=" + deviceId);
             RunDebounced();
             return 0;
         }
 
         private void RunDebounced()
         {
+            bool shouldFireImmediately = false;
+            CancellationTokenSource? ctsToCancel = null;
+            CancellationTokenSource? newCts = null;
+
             lock (_gate)
             {
                 var now = DateTimeOffset.UtcNow;
-                if (now - _lastRun < TimeSpan.FromSeconds(1))
+                if (now - _lastRun >= MinInterval)
                 {
-                    return;
+                    // leading edge
+                    _lastRun = now;
+                    shouldFireImmediately = true;
                 }
 
-                _lastRun = now;
+                // always schedule trailing edge to catch burst second device
+                ctsToCancel = _pendingCts;
+                newCts = new CancellationTokenSource();
+                _pendingCts = newCts;
             }
 
-            _onChanged();
+            try { ctsToCancel?.Cancel(); } catch { }
+            try { ctsToCancel?.Dispose(); } catch { }
+
+            if (shouldFireImmediately)
+            {
+                try { _onChanged(); } catch (Exception ex) { WriteError("RunDebounced immediate failed", ex); }
+            }
+
+            // trailing edge after CoalesceWindow - ensures second device in burst gets applied
+            var token = newCts.Token;
+            Task.Delay(CoalesceWindow, token).ContinueWith(t =>
+            {
+                if (t.IsCanceled) return;
+                lock (_gate)
+                {
+                    // if another burst already updated _lastRun recently, we still fire trailing to ensure both render+capture handled
+                }
+                try { _onChanged(); } catch (Exception ex) { WriteError("RunDebounced trailing failed", ex); }
+            }, TaskScheduler.Default);
         }
     }
 
     private static void InitializeConsole(Options options)
     {
+        // Background flag originally hid console, but window still appears on this system
+        // Keep console visible so diagnostics are paste-able. Always ensure console.
+        EnsureConsole();
         if (options.Background)
         {
-            return;
+            WriteInfo("Background flag set - console kept visible for diagnostics (window was supposed to be hidden)");
         }
-
-        EnsureConsole();
     }
 
     private static void EnsureConsole()
@@ -729,6 +1011,44 @@ internal static class Program
     {
         Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
         Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+    }
+
+    private static void DumpSystemInfo()
+    {
+        try
+        {
+            WriteInfo("=== System Info ===");
+            WriteInfo("OSVersion: " + Environment.OSVersion.ToString());
+            try { WriteInfo("Runtime OSDescription: " + System.Runtime.InteropServices.RuntimeInformation.OSDescription); } catch { }
+            try { WriteInfo("64-bit OS: " + Environment.Is64BitOperatingSystem + " 64-bit Proc: " + Environment.Is64BitProcess); } catch { }
+            try
+            {
+                var winVer = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "DisplayVersion", null);
+                var build = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuild", null);
+                var ubr = Microsoft.Win32.Registry.GetValue(@"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR", null);
+                WriteInfo("DisplayVersion: " + (winVer ?? "n/a") + " Build: " + (build ?? "n/a") + " UBR: " + (ubr ?? "n/a"));
+            }
+            catch (Exception ex) { WriteInfo("Registry read failed: " + ex.Message); }
+            try
+            {
+                using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+                var p = new System.Security.Principal.WindowsPrincipal(id);
+                var isAdmin = p.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+                WriteInfo("Admin: " + isAdmin + " User: " + id.Name);
+            }
+            catch (Exception ex) { WriteInfo("Admin check failed: " + ex.Message); }
+            WriteInfo("Exe: " + (Environment.ProcessPath ?? "n/a"));
+            WriteInfo("Startup shortcut: " + Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "AutoDefaultToHeadset.lnk"));
+            try
+            {
+                var startup = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "AutoDefaultToHeadset.lnk");
+                if (File.Exists(startup)) WriteInfo("Startup .lnk exists: " + startup);
+                else WriteInfo("Startup .lnk NOT found");
+            }
+            catch { }
+            WriteInfo("=== End System Info ===");
+        }
+        catch (Exception ex) { WriteError("DumpSystemInfo failed", ex); }
     }
 
     private static bool TryReplaceExistingInstance(Mutex instanceMutex)
@@ -975,6 +1295,8 @@ internal static class Program
         {
             try
             {
+                // keep lock for console ordering; file logging could be added here
+                System.Diagnostics.Debug.WriteLine(line);
             }
             catch
             {
@@ -986,6 +1308,11 @@ internal static class Program
             if (ConsoleAvailable)
             {
                 Console.WriteLine(line);
+            }
+            else
+            {
+                // background mode: still try to write to attached parent if any
+                try { Console.WriteLine(line); } catch { }
             }
         }
         catch
@@ -1097,6 +1424,9 @@ internal static class ComIds
 {
     public static readonly Guid MMDeviceEnumerator = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
     public static readonly Guid PolicyConfigClient = new("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9");
+    public static readonly Guid PolicyConfigVistaClient = new("294935CE-F637-4E7C-A41B-AB255460B862");
+    public static readonly Guid IPolicyConfig = new("F8679F50-850A-41CF-9C72-430F290290C8");
+    public static readonly Guid IPolicyConfigVista = new("568B9108-44BF-40B4-9006-86AFE5B5A620");
 }
 
 [ComImport]
@@ -1198,40 +1528,79 @@ internal interface IMMNotificationClient
 internal interface IPolicyConfig
 {
     [PreserveSig]
-    int GetMixFormat();
+    int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr ppFormat);
 
     [PreserveSig]
-    int GetDeviceFormat();
+    int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bDefault, IntPtr ppFormat);
 
     [PreserveSig]
-    int ResetDeviceFormat();
+    int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName);
 
     [PreserveSig]
-    int SetDeviceFormat();
+    int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pEndpointFormat, IntPtr MixFormat);
 
     [PreserveSig]
-    int GetProcessingPeriod();
+    int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bDefault, IntPtr pmftDefaultPeriod, IntPtr pmftMinimumPeriod);
 
     [PreserveSig]
-    int SetProcessingPeriod();
+    int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pmftPeriod);
 
     [PreserveSig]
-    int GetShareMode();
+    int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pMode);
 
     [PreserveSig]
-    int SetShareMode();
+    int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr mode);
 
     [PreserveSig]
-    int GetPropertyValue();
+    int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bFxStore, IntPtr key, IntPtr pv);
 
     [PreserveSig]
-    int SetPropertyValue();
+    int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bFxStore, IntPtr key, IntPtr pv);
 
     [PreserveSig]
     int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ERole role);
 
     [PreserveSig]
-    int SetEndpointVisibility();
+    int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bVisible);
+}
+
+[ComImport]
+[Guid("568B9108-44BF-40B4-9006-86AFE5B5A620")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IPolicyConfigVista
+{
+    [PreserveSig]
+    int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr ppFormat);
+
+    [PreserveSig]
+    int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bDefault, IntPtr ppFormat);
+
+    [PreserveSig]
+    int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pEndpointFormat, IntPtr MixFormat);
+
+    [PreserveSig]
+    int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, int bDefault, IntPtr pmftDefaultPeriod, IntPtr pmftMinimumPeriod);
+
+    [PreserveSig]
+    int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pmftPeriod);
+
+    [PreserveSig]
+    int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr pMode);
+
+    [PreserveSig]
+    int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, IntPtr mode);
+
+    [PreserveSig]
+    int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bFxStore, IntPtr key, IntPtr pv);
+
+    [PreserveSig]
+    int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bFxStore, IntPtr key, IntPtr pv);
+
+    [PreserveSig]
+    int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string deviceId, ERole role);
+
+    [PreserveSig]
+    int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string pszDeviceName, [MarshalAs(UnmanagedType.Bool)] bool bVisible);
 }
 
 internal static class NativeMethods
