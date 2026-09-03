@@ -570,21 +570,21 @@ internal static class Program
 
             Console.WriteLine();
             Console.WriteLine("Choose match mode:");
-            Console.WriteLine("  1. Exact endpoint IDs");
-            Console.WriteLine("  2. Name contains");
-            Console.Write("Mode [1]: ");
+            Console.WriteLine("  1. Exact endpoint IDs (fragile across replug/BT repair)");
+            Console.WriteLine("  2. Name contains (persistent)");
+            Console.Write("Mode [2]: ");
             var mode = Console.ReadLine();
 
             string arguments;
-            if (string.Equals(mode, "2", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(mode, "1", StringComparison.OrdinalIgnoreCase))
+            {
+                arguments = "--background --render-id " + Quote(render.Id) + " --capture-id " + Quote(capture.Id);
+            }
+            else
             {
                 var renderMatch = PromptForText("Output name contains", SuggestMatch(render.Name));
                 var captureMatch = PromptForText("Input name contains", SuggestMatch(capture.Name));
                 arguments = "--background --render-match " + Quote(renderMatch) + " --capture-match " + Quote(captureMatch);
-            }
-            else
-            {
-                arguments = "--background --render-id " + Quote(render.Id) + " --capture-id " + Quote(capture.Id);
             }
 
             var exePath = Environment.ProcessPath;
@@ -718,7 +718,20 @@ internal static class Program
 
             if (!string.IsNullOrWhiteSpace(exactId))
             {
-                return devices.FirstOrDefault(device => string.Equals(device.Id, exactId, StringComparison.OrdinalIgnoreCase));
+                var exact = devices.FirstOrDefault(device => string.Equals(device.Id, exactId, StringComparison.OrdinalIgnoreCase));
+                if (exact != null) return exact;
+
+                // exact ID stale (common on BT/Xbox re-pair, IDs {c440...} vs {cd004...})
+                // fallback to name-contains so old shortcut doesn't silently do nothing
+                var staleExists = EnumerateDevices(flow, DeviceState.All).Any(d => string.Equals(d.Id, exactId, StringComparison.OrdinalIgnoreCase));
+                if (!staleExists)
+                {
+                    WriteInfo("Exact " + flow + " Id not found even among All (stale) " + exactId + " -> falling back to name match " + string.Join(",", matches));
+                }
+                else
+                {
+                    WriteInfo("Exact " + flow + " Id not active " + exactId + " -> falling back to name match");
+                }
             }
 
             return devices
