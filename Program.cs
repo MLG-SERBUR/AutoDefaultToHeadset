@@ -651,13 +651,7 @@ internal static class Program
 
         private static string SuggestMatch(string name)
         {
-            var open = name.IndexOf('(');
-            var close = name.LastIndexOf(')');
-            if (open >= 0 && close > open + 1)
-            {
-                return name.Substring(open + 1, close - open - 1);
-            }
-
+            // exact mode: return full friendly name, not substring inside ()
             return name;
         }
 
@@ -721,21 +715,20 @@ internal static class Program
                 var exact = devices.FirstOrDefault(device => string.Equals(device.Id, exactId, StringComparison.OrdinalIgnoreCase));
                 if (exact != null) return exact;
 
-                // exact ID stale (common on BT/Xbox re-pair, IDs {c440...} vs {cd004...})
-                // fallback to name-contains so old shortcut doesn't silently do nothing
                 var staleExists = EnumerateDevices(flow, DeviceState.All).Any(d => string.Equals(d.Id, exactId, StringComparison.OrdinalIgnoreCase));
                 if (!staleExists)
                 {
-                    WriteInfo("Exact " + flow + " Id not found even among All (stale) " + exactId + " -> falling back to name match " + string.Join(",", matches));
+                    WriteInfo("Exact " + flow + " Id not found even among All (stale) " + exactId + " -> falling back to exact name match " + string.Join(",", matches));
                 }
                 else
                 {
-                    WriteInfo("Exact " + flow + " Id not active " + exactId + " -> falling back to name match");
+                    WriteInfo("Exact " + flow + " Id not active " + exactId + " -> falling back to exact name match");
                 }
             }
 
+            // exact-only on friendly name (no Contains)
             return devices
-                .Where(device => matches.Any(match => device.Name.Contains(match, StringComparison.OrdinalIgnoreCase)))
+                .Where(device => matches.Any(match => device.Name.Equals(match, StringComparison.OrdinalIgnoreCase)))
                 .OrderByDescending(device => Score(device, matches))
                 .ThenBy(device => device.Name, StringComparer.OrdinalIgnoreCase)
                 .FirstOrDefault();
@@ -743,6 +736,7 @@ internal static class Program
 
         private static int Score(AudioDevice device, IReadOnlyList<string> matches)
         {
+            // exact-only mode: only exact equality scores, headset bonus kept for tie-break
             var score = 0;
 
             foreach (var match in matches)
@@ -750,14 +744,6 @@ internal static class Program
                 if (device.Name.Equals(match, StringComparison.OrdinalIgnoreCase))
                 {
                     score += 100;
-                }
-                else if (device.Name.StartsWith(match, StringComparison.OrdinalIgnoreCase))
-                {
-                    score += 50;
-                }
-                else if (device.Name.Contains(match, StringComparison.OrdinalIgnoreCase))
-                {
-                    score += 10;
                 }
             }
 
