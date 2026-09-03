@@ -13,19 +13,8 @@ namespace AutoDefaultToHeadset;
 
 internal static class Program
 {
-    private static readonly string[] DefaultRenderMatches =
-    {
-        "headset",
-        "headphones",
-        "xbox"
-    };
-
-    private static readonly string[] DefaultCaptureMatches =
-    {
-        "headset",
-        "xbox",
-        "microphone"
-    };
+    private static readonly string[] DefaultRenderMatches = Array.Empty<string>();
+    private static readonly string[] DefaultCaptureMatches = Array.Empty<string>();
 
     private static readonly object LogLock = new();
     private const string InstanceMutexName = @"Local\AutoDefaultToHeadset";
@@ -206,8 +195,6 @@ internal static class Program
 
     private sealed class Options
     {
-        public string? RenderId { get; private set; }
-        public string? CaptureId { get; private set; }
         public List<string> RenderMatches { get; } = new(DefaultRenderMatches);
         public List<string> CaptureMatches { get; } = new(DefaultCaptureMatches);
         public bool Background { get; private set; }
@@ -216,8 +203,8 @@ internal static class Program
         public bool InstallStartup { get; private set; }
         public bool ShowHelp { get; private set; }
 
-        public string RenderDescription => RenderId ?? string.Join(", ", RenderMatches.Select(s => "'" + s + "'"));
-        public string CaptureDescription => CaptureId ?? string.Join(", ", CaptureMatches.Select(s => "'" + s + "'"));
+        public string RenderDescription => string.Join(", ", RenderMatches.Select(s => "'" + s + "'"));
+        public string CaptureDescription => string.Join(", ", CaptureMatches.Select(s => "'" + s + "'"));
 
         public static Options Parse(string[] args)
         {
@@ -229,16 +216,6 @@ internal static class Program
 
                 switch (argument.ToLowerInvariant())
                 {
-                    case "--render-id":
-                        options.RenderId = RequireValue(args, ref i, argument);
-                        break;
-                    case "--capture-id":
-                        options.CaptureId = RequireValue(args, ref i, argument);
-                        break;
-                    case "--id":
-                        options.RenderId = RequireValue(args, ref i, argument);
-                        options.CaptureId = options.RenderId;
-                        break;
                     case "--render-match":
                         options.RenderMatches.Clear();
                         options.RenderMatches.Add(RequireValue(args, ref i, argument));
@@ -275,6 +252,13 @@ internal static class Program
                         options.ShowHelp = true;
                         break;
                     default:
+                        // legacy --render-id/--capture-id/--id no longer supported: exact name only
+                        if (argument.Equals("--render-id", StringComparison.OrdinalIgnoreCase) ||
+                            argument.Equals("--capture-id", StringComparison.OrdinalIgnoreCase) ||
+                            argument.Equals("--id", StringComparison.OrdinalIgnoreCase))
+                        {
+                            throw new ArgumentException(argument + " no longer supported. Use --render-match / --capture-match with exact friendly name. Run --install to recreate shortcut.");
+                        }
                         throw new ArgumentException("Unknown argument: " + argument);
                 }
             }
@@ -395,14 +379,12 @@ internal static class Program
         {
             try
             {
-                // Log current defaults before attempt (helps diagnose comm vs default)
                 LogCurrentDefaults("before " + source);
 
-                // Retry loop: device may not be ready immediately after plug
                 for (var attempt = 0; attempt < 3; attempt++)
                 {
-                    var render = FindBestDevice(EDataFlow.eRender, _options.RenderId, _options.RenderMatches);
-                    var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureId, _options.CaptureMatches);
+                    var render = FindBestDevice(EDataFlow.eRender, _options.RenderMatches);
+                    var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureMatches);
 
                     var didWork = false;
 
@@ -529,26 +511,10 @@ internal static class Program
                         WriteInfo("  Default " + flow + " " + role + ": " + defName + " [" + (defId ?? "null") + "]");
                     }
                 }
-                // show what would match
-                var render = FindBestDevice(EDataFlow.eRender, _options.RenderId, _options.RenderMatches);
-                var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureId, _options.CaptureMatches);
+                var render = FindBestDevice(EDataFlow.eRender, _options.RenderMatches);
+                var capture = FindBestDevice(EDataFlow.eCapture, _options.CaptureMatches);
                 WriteInfo("Match render: " + (render != null ? render.Name + " [" + render.State + "] " + render.Id : "NONE for " + _options.RenderDescription));
                 WriteInfo("Match capture: " + (capture != null ? capture.Name + " [" + capture.State + "] " + capture.Id : "NONE for " + _options.CaptureDescription));
-                // explicit check for exact IDs if supplied
-                if (!string.IsNullOrWhiteSpace(_options.RenderId))
-                {
-                    var devId = _options.RenderId;
-                    var exists = EnumerateDevices(EDataFlow.eRender, DeviceState.All).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
-                    var active = EnumerateDevices(EDataFlow.eRender, DeviceState.Active).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
-                    WriteInfo("RenderId " + devId + " exists(all)=" + exists + " active=" + active);
-                }
-                if (!string.IsNullOrWhiteSpace(_options.CaptureId))
-                {
-                    var devId = _options.CaptureId;
-                    var exists = EnumerateDevices(EDataFlow.eCapture, DeviceState.All).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
-                    var active = EnumerateDevices(EDataFlow.eCapture, DeviceState.Active).Any(x => string.Equals(x.Id, devId, StringComparison.OrdinalIgnoreCase));
-                    WriteInfo("CaptureId " + devId + " exists(all)=" + exists + " active=" + active);
-                }
                 WriteInfo("=== End Audio Diagnostics ===");
             }
             catch (Exception ex) { WriteError("DumpDiagnostics failed", ex); }
@@ -568,24 +534,14 @@ internal static class Program
             var render = PromptForDevice("output", renderDevices);
             var capture = PromptForDevice("input", captureDevices);
 
+            // exact name only, no ID mode
+            var renderMatch = render.Name;
+            var captureMatch = capture.Name;
             Console.WriteLine();
-            Console.WriteLine("Choose match mode:");
-            Console.WriteLine("  1. Exact endpoint IDs (fragile across replug/BT repair)");
-            Console.WriteLine("  2. Name contains (persistent)");
-            Console.Write("Mode [2]: ");
-            var mode = Console.ReadLine();
-
-            string arguments;
-            if (string.Equals(mode, "1", StringComparison.OrdinalIgnoreCase))
-            {
-                arguments = "--background --render-id " + Quote(render.Id) + " --capture-id " + Quote(capture.Id);
-            }
-            else
-            {
-                var renderMatch = PromptForText("Output name contains", SuggestMatch(render.Name));
-                var captureMatch = PromptForText("Input name contains", SuggestMatch(capture.Name));
-                arguments = "--background --render-match " + Quote(renderMatch) + " --capture-match " + Quote(captureMatch);
-            }
+            Console.WriteLine("Using exact friendly name (persistent):");
+            Console.WriteLine("  Render: " + renderMatch);
+            Console.WriteLine("  Capture: " + captureMatch);
+            var arguments = "--background --render-match " + Quote(renderMatch) + " --capture-match " + Quote(captureMatch);
 
             var exePath = Environment.ProcessPath;
             if (string.IsNullOrWhiteSpace(exePath))
@@ -706,53 +662,11 @@ internal static class Program
             Console.WriteLine();
         }
 
-        private AudioDevice? FindBestDevice(EDataFlow flow, string? exactId, IReadOnlyList<string> matches)
+        private AudioDevice? FindBestDevice(EDataFlow flow, IReadOnlyList<string> matches)
         {
             var devices = EnumerateDevices(flow, DeviceState.Active);
-
-            if (!string.IsNullOrWhiteSpace(exactId))
-            {
-                var exact = devices.FirstOrDefault(device => string.Equals(device.Id, exactId, StringComparison.OrdinalIgnoreCase));
-                if (exact != null) return exact;
-
-                var staleExists = EnumerateDevices(flow, DeviceState.All).Any(d => string.Equals(d.Id, exactId, StringComparison.OrdinalIgnoreCase));
-                if (!staleExists)
-                {
-                    WriteInfo("Exact " + flow + " Id not found even among All (stale) " + exactId + " -> falling back to exact name match " + string.Join(",", matches));
-                }
-                else
-                {
-                    WriteInfo("Exact " + flow + " Id not active " + exactId + " -> falling back to exact name match");
-                }
-            }
-
-            // exact-only on friendly name (no Contains)
-            return devices
-                .Where(device => matches.Any(match => device.Name.Equals(match, StringComparison.OrdinalIgnoreCase)))
-                .OrderByDescending(device => Score(device, matches))
-                .ThenBy(device => device.Name, StringComparer.OrdinalIgnoreCase)
-                .FirstOrDefault();
-        }
-
-        private static int Score(AudioDevice device, IReadOnlyList<string> matches)
-        {
-            // exact-only mode: only exact equality scores, headset bonus kept for tie-break
-            var score = 0;
-
-            foreach (var match in matches)
-            {
-                if (device.Name.Equals(match, StringComparison.OrdinalIgnoreCase))
-                {
-                    score += 100;
-                }
-            }
-
-            if (device.Name.Contains("headset", StringComparison.OrdinalIgnoreCase))
-            {
-                score += 20;
-            }
-
-            return score;
+            // exact only, no substring, no fallback, no tiebreaker bonus
+            return devices.FirstOrDefault(device => matches.Any(match => device.Name.Equals(match, StringComparison.OrdinalIgnoreCase)));
         }
 
         private List<AudioDevice> EnumerateDevices(EDataFlow flow, DeviceState stateMask)
@@ -1231,12 +1145,9 @@ internal static class Program
         Console.WriteLine("Options:");
         Console.WriteLine("  --install               Select devices, create Startup shortcut, and launch.");
         Console.WriteLine("  --list-devices          List output/input endpoint names and ids, then exit.");
-        Console.WriteLine("  --match <text>          Match same text for output and input.");
-        Console.WriteLine("  --render-match <text>   Match active output device by friendly-name substring.");
-        Console.WriteLine("  --capture-match <text>  Match active input device by friendly-name substring.");
-        Console.WriteLine("  --id <id>               Use same exact endpoint id for output and input.");
-        Console.WriteLine("  --render-id <id>        Use exact output endpoint id.");
-        Console.WriteLine("  --capture-id <id>       Use exact input endpoint id.");
+        Console.WriteLine("  --match <text>          Match same exact friendly name for output and input.");
+        Console.WriteLine("  --render-match <text>   Match active output device by exact friendly name (case-insensitive).");
+        Console.WriteLine("  --capture-match <text>  Match active input device by exact friendly name.");
         Console.WriteLine("  --background            Run without opening a console window.");
         Console.WriteLine("  --replace-existing      Replace a running switcher instance (default).");
         Console.WriteLine("  --exit-if-running       Exit instead of replacing an existing switcher instance.");
