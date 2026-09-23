@@ -1,3 +1,7 @@
+# No longer maintained, see https://github.com/MLG-SERBUR/AutoDefaultToHeadset-NativeAOT instead
+
+---
+
 # Auto Default To Headset
 
 Lightweight Windows utility that sets matching headset output and input devices as default when they appear.
